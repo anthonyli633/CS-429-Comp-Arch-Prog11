@@ -20,10 +20,11 @@ The executable runs the tests in `main.c`. The cache implementation is in
 
 The tests in `main.c` include targeted unit tests for cold misses and hit
 accounting, write hits, L1 data LRU replacement, dirty L1 write-back into L2,
-and split L1 instruction/data coherency. The coherency test writes through the
-data cache, confirms the stale instruction line is invalidated, then reads the
-same address through the instruction cache and verifies it receives the updated
-value after the dirty data line is written back to L2.
+L2 replacement ordering after an L1 write-back, and split L1 instruction/data
+coherency. The coherency test writes through the data cache, confirms the stale
+instruction line is invalidated, then reads the same address through the
+instruction cache and verifies it receives the updated value after the dirty data
+line is written back to L2.
 
 To compare replacement policies, the test harness runs the same conflict-heavy
 trace once with `LRU` and once with `RANDOM`. The trace cycles over five cache

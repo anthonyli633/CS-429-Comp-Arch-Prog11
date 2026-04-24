@@ -317,8 +317,8 @@ static cache_line_t *fill_l1_line(cache_desc_t *cache, uint64_t mem_addr) {
     size_t way = choose_victim_way(cache, index);
     cache_line_t *line = line_at(cache, index, way);
 
-    l2_read_line(mem_addr, data);
     write_back_dirty_l1_victim(cache, line, index);
+    l2_read_line(mem_addr, data);
 
     line->valid = 1;
     line->modified = 0;
