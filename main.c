@@ -96,6 +96,28 @@ static void test_l1_writeback_to_l2(void) {
           l2_line->data[7] == 0xe1);
 }
 
+static void test_l2_backinvalidate_dirty_l1d_order(void) {
+    uint64_t a = 0x0;
+    uint64_t b = HW11_L2_SIZE / HW11_L2_ASSOC;
+    uint64_t c = 2 * (HW11_L2_SIZE / HW11_L2_ASSOC);
+    uint64_t d = 3 * (HW11_L2_SIZE / HW11_L2_ASSOC);
+    uint64_t e = 4 * (HW11_L2_SIZE / HW11_L2_ASSOC);
+    cache_line_t *line;
+
+    init_cache(LRU);
+    prepare_byte(d, 0xd4);
+
+    write_cache(c, 0xc3, DATA);
+    (void)read_cache(d, DATA);
+    (void)read_cache(a, INSTR);
+    (void)read_cache(b, INSTR);
+    (void)read_cache(e, DATA);
+
+    line = get_l1_data_cache_line(d);
+    check("L2 miss backinvalidates dirty L1D victim before L1D writeback retouches L2",
+          line != NULL && line->valid && !line->modified && line->data[0] == 0xd4);
+}
+
 static void test_split_l1_coherence(void) {
     uint64_t addr = 0x6123;
     cache_line_t *data_line;
@@ -156,6 +178,7 @@ int main(int argc, char *argv[]) {
     test_basic_data_read_write();
     test_l1_data_lru();
     test_l1_writeback_to_l2();
+    test_l2_backinvalidate_dirty_l1d_order();
     test_split_l1_coherence();
     compare_replacement_policies();
 
