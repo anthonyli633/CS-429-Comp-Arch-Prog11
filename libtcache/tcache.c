@@ -1,418 +1,439 @@
 #include "tcache.h"
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define CACHE_LINE_SIZE 64
+#define LINE_SIZE 64U
+#define OFFSET_BITS 6U
 
-#define L1I_LINE_COUNT (HW11_L1_SIZE / CACHE_LINE_SIZE)
-#define L1D_LINE_COUNT (HW11_L1_SIZE / CACHE_LINE_SIZE)
-#define L2_LINE_COUNT  (HW11_L2_SIZE / CACHE_LINE_SIZE)
+#define L1_INSTR_SETS (HW11_L1_SIZE / (LINE_SIZE * HW11_L1_INSTR_ASSOC))
+#define L1_DATA_SETS (HW11_L1_SIZE / (LINE_SIZE * HW11_L1_DATA_ASSOC))
+#define L2_SETS (HW11_L2_SIZE / (LINE_SIZE * HW11_L2_ASSOC))
 
 typedef struct {
-    cache_line_t *entries;
-    uint64_t *recent;
-    size_t set_count;
-    size_t ways;
-    cache_stats_t stats;
-} cache_store_t;
+    cache_line_t *lines;
+    uint64_t *lru;
+    size_t sets;
+    size_t assoc;
+    cache_stats_t *stats;
+    uint64_t *clock;
+} cache_desc_t;
+
+static cache_line_t l1_instr_lines[L1_INSTR_SETS][HW11_L1_INSTR_ASSOC];
+static cache_line_t l1_data_lines[L1_DATA_SETS][HW11_L1_DATA_ASSOC];
+static cache_line_t l2_lines[L2_SETS][HW11_L2_ASSOC];
+
+static uint64_t l1_instr_lru[L1_INSTR_SETS][HW11_L1_INSTR_ASSOC];
+static uint64_t l1_data_lru[L1_DATA_SETS][HW11_L1_DATA_ASSOC];
+static uint64_t l2_lru[L2_SETS][HW11_L2_ASSOC];
+
+static cache_stats_t l1_instr_stats;
+static cache_stats_t l1_data_stats;
+static cache_stats_t l2_stats;
+
+static uint64_t l1_instr_clock;
+static uint64_t l1_data_clock;
+static uint64_t l2_clock;
 
 static replacement_policy_e active_policy;
-static uint64_t lru_clock;
+static uint32_t random_state;
 
-static cache_line_t l1i_entries[L1I_LINE_COUNT];
-static cache_line_t l1d_entries[L1D_LINE_COUNT];
-static cache_line_t l2_entries[L2_LINE_COUNT];
+static cache_desc_t l1_instr_cache = {
+    &l1_instr_lines[0][0],
+    &l1_instr_lru[0][0],
+    L1_INSTR_SETS,
+    HW11_L1_INSTR_ASSOC,
+    &l1_instr_stats,
+    &l1_instr_clock
+};
 
-static uint64_t l1i_recent[L1I_LINE_COUNT];
-static uint64_t l1d_recent[L1D_LINE_COUNT];
-static uint64_t l2_recent[L2_LINE_COUNT];
+static cache_desc_t l1_data_cache = {
+    &l1_data_lines[0][0],
+    &l1_data_lru[0][0],
+    L1_DATA_SETS,
+    HW11_L1_DATA_ASSOC,
+    &l1_data_stats,
+    &l1_data_clock
+};
 
-static cache_store_t l1i;
-static cache_store_t l1d;
-static cache_store_t l2;
+static cache_desc_t l2_cache = {
+    &l2_lines[0][0],
+    &l2_lru[0][0],
+    L2_SETS,
+    HW11_L2_ASSOC,
+    &l2_stats,
+    &l2_clock
+};
 
-static size_t calc_set_count(size_t cache_size, size_t assoc) {
-    return cache_size / (CACHE_LINE_SIZE * assoc);
+static unsigned index_bits(size_t sets) {
+    unsigned bits = 0;
+
+    while (sets > 1) {
+        ++bits;
+        sets >>= 1;
+    }
+
+    return bits;
 }
 
-static void setup_cache(cache_store_t *c, cache_line_t *entries, uint64_t *recent,
-                        size_t cache_size, size_t assoc) {
-    c->entries = entries;
-    c->recent = recent;
-    c->set_count = calc_set_count(cache_size, assoc);
-    c->ways = assoc;
-    c->stats.accesses = 0;
-    c->stats.misses = 0;
+static uint64_t line_base(uint64_t mem_addr) {
+    return mem_addr & ~(uint64_t)(LINE_SIZE - 1U);
 }
 
-static uint64_t block_number(uint64_t addr) {
-    return addr >> 6;
+static size_t cache_index(uint64_t mem_addr, const cache_desc_t *cache) {
+    return (size_t)((mem_addr >> OFFSET_BITS) & (cache->sets - 1U));
 }
 
-static uint64_t block_start(uint64_t addr) {
-    return addr & ~((uint64_t)CACHE_LINE_SIZE - 1);
+static uint64_t cache_tag(uint64_t mem_addr, const cache_desc_t *cache) {
+    return mem_addr >> (OFFSET_BITS + index_bits(cache->sets));
 }
 
-static size_t block_offset(uint64_t addr) {
-    return (size_t)(addr & (CACHE_LINE_SIZE - 1));
+static uint64_t compose_line_base(uint64_t tag, size_t index, const cache_desc_t *cache) {
+    return ((tag << index_bits(cache->sets)) | (uint64_t)index) << OFFSET_BITS;
 }
 
-static size_t set_index(const cache_store_t *c, uint64_t addr) {
-    return block_number(addr) % c->set_count;
+static cache_line_t *line_at(const cache_desc_t *cache, size_t index, size_t way) {
+    return &cache->lines[index * cache->assoc + way];
 }
 
-static uint64_t tag_for_addr(const cache_store_t *c, uint64_t addr) {
-    return block_number(addr) / c->set_count;
+static uint64_t *lru_at(const cache_desc_t *cache, size_t index, size_t way) {
+    return &cache->lru[index * cache->assoc + way];
 }
 
-static cache_line_t *set_begin(cache_store_t *c, size_t idx) {
-    return &c->entries[idx * c->ways];
-}
+static cache_line_t *find_line_in_cache(const cache_desc_t *cache, uint64_t mem_addr) {
+    size_t index = cache_index(mem_addr, cache);
+    uint64_t tag = cache_tag(mem_addr, cache);
+    size_t way;
 
-static uint64_t *set_recent_begin(cache_store_t *c, size_t idx) {
-    return &c->recent[idx * c->ways];
-}
+    for (way = 0; way < cache->assoc; ++way) {
+        cache_line_t *line = line_at(cache, index, way);
 
-static cache_line_t *lookup_line(cache_store_t *c, uint64_t addr) {
-    size_t idx = set_index(c, addr);
-    uint64_t tag = tag_for_addr(c, addr);
-    cache_line_t *bucket = set_begin(c, idx);
-
-    for (size_t i = 0; i < c->ways; i++) {
-        if (bucket[i].valid && bucket[i].tag == tag) {
-            return &bucket[i];
+        if (line->valid && line->tag == tag) {
+            return line;
         }
     }
 
     return NULL;
 }
 
-static void mark_used(cache_store_t *c, cache_line_t *entry) {
-    size_t pos = (size_t)(entry - c->entries);
-    c->recent[pos] = ++lru_clock;
+static void touch_way(const cache_desc_t *cache, size_t index, size_t way) {
+    *lru_at(cache, index, way) = ++(*cache->clock);
 }
 
-static uint64_t entry_base_addr(cache_store_t *c, cache_line_t *entry) {
-    size_t pos = (size_t)(entry - c->entries);
-    size_t idx = pos / c->ways;
-    uint64_t blk = (entry->tag * c->set_count) + idx;
-    return blk * CACHE_LINE_SIZE;
-}
+static size_t way_for_line(const cache_desc_t *cache, size_t index, const cache_line_t *line) {
+    size_t way;
 
-static void clear_entry(cache_store_t *c, cache_line_t *entry) {
-    size_t pos = (size_t)(entry - c->entries);
-    memset(entry, 0, sizeof(*entry));
-    c->recent[pos] = 0;
-}
-
-static void store_block_to_mem(uint64_t base, const uint8_t data[CACHE_LINE_SIZE]) {
-    for (size_t i = 0; i < CACHE_LINE_SIZE; i++) {
-        write_memory(base + i, data[i]);
-    }
-}
-
-static void load_block_from_mem(uint64_t base, uint8_t data[CACHE_LINE_SIZE]) {
-    for (size_t i = 0; i < CACHE_LINE_SIZE; i++) {
-        data[i] = read_memory(base + i);
-    }
-}
-
-static cache_line_t *choose_victim(cache_store_t *c, uint64_t addr) {
-    size_t idx = set_index(c, addr);
-    cache_line_t *bucket = set_begin(c, idx);
-    uint64_t *recent = set_recent_begin(c, idx);
-
-    for (size_t i = 0; i < c->ways; i++) {
-        if (!bucket[i].valid) {
-            return &bucket[i];
+    for (way = 0; way < cache->assoc; ++way) {
+        if (line_at(cache, index, way) == line) {
+            return way;
         }
     }
 
-    if (active_policy == RANDOM) {
-        return &bucket[rand() % c->ways];
-    }
-
-    size_t victim = 0;
-    for (size_t i = 1; i < c->ways; i++) {
-        if (recent[i] < recent[victim]) {
-            victim = i;
-        }
-    }
-
-    return &bucket[victim];
-}
-
-static void evict_line(cache_store_t *c, cache_line_t *entry);
-
-static cache_line_t *reserve_line(cache_store_t *c, uint64_t addr) {
-    cache_line_t *victim = choose_victim(c, addr);
-
-    if (victim->valid) {
-        evict_line(c, victim);
-    }
-
-    return victim;
-}
-
-static cache_line_t *place_block(cache_store_t *c, uint64_t addr,
-                                 const uint8_t data[CACHE_LINE_SIZE],
-                                 uint8_t dirty) {
-    cache_line_t *entry = reserve_line(c, addr);
-
-    memcpy(entry->data, data, CACHE_LINE_SIZE);
-    entry->tag = tag_for_addr(c, addr);
-    entry->valid = 1;
-    entry->modified = dirty;
-    mark_used(c, entry);
-
-    return entry;
-}
-
-static void push_block_to_l2(uint64_t addr, const uint8_t data[CACHE_LINE_SIZE],
-                             uint8_t track_stats) {
-    cache_line_t *entry = lookup_line(&l2, addr);
-
-    if (track_stats) {
-        l2.stats.accesses++;
-    }
-
-    if (entry == NULL) {
-        if (track_stats) {
-            l2.stats.misses++;
-        }
-        entry = reserve_line(&l2, addr);
-    }
-
-    memcpy(entry->data, data, CACHE_LINE_SIZE);
-    entry->tag = tag_for_addr(&l2, addr);
-    entry->valid = 1;
-    entry->modified = 1;
-    mark_used(&l2, entry);
-}
-
-static cache_line_t *find_dirty_l1_line(uint64_t addr) {
-    cache_line_t *entry = lookup_line(&l1i, addr);
-
-    if (entry != NULL && entry->modified) {
-        return entry;
-    }
-
-    entry = lookup_line(&l1d, addr);
-    if (entry != NULL && entry->modified) {
-        return entry;
-    }
-
-    return NULL;
-}
-
-static void discard_l1_copy(cache_store_t *c, uint64_t addr) {
-    cache_line_t *entry = lookup_line(c, addr);
-
-    if (entry == NULL) {
-        return;
-    }
-
-    clear_entry(c, entry);
-}
-
-static uint8_t flush_l1_dirty_to_mem(cache_store_t *c, uint64_t addr,
-                                     uint64_t base) {
-    cache_line_t *entry = lookup_line(c, addr);
-
-    if (entry == NULL) {
-        return 0;
-    }
-
-    if (entry->modified) {
-        store_block_to_mem(base, entry->data);
-        clear_entry(c, entry);
-        return 1;
-    }
-
-    clear_entry(c, entry);
     return 0;
 }
 
-static void evict_line(cache_store_t *c, cache_line_t *entry) {
-    uint64_t base;
-    uint8_t used_l1_newer_data = 0;
-    cache_line_t *dirty_l1;
+static uint32_t next_random(void) {
+    random_state = random_state * 1103515245U + 12345U;
+    return random_state;
+}
 
-    if (!entry->valid) {
-        return;
-    }
+static size_t choose_victim_way(const cache_desc_t *cache, size_t index) {
+    size_t way;
+    size_t victim_way = 0;
+    uint64_t oldest_lru = UINT64_MAX;
 
-    base = entry_base_addr(c, entry);
-
-    if (c == &l2) {
-        dirty_l1 = find_dirty_l1_line(base);
-
-        if (dirty_l1 != NULL) {
-            l2.stats.accesses++;
-            store_block_to_mem(base, dirty_l1->data);
-            dirty_l1->modified = 0;
-            used_l1_newer_data = 1;
+    for (way = 0; way < cache->assoc; ++way) {
+        if (!line_at(cache, index, way)->valid) {
+            return way;
         }
+    }
 
-        used_l1_newer_data |= flush_l1_dirty_to_mem(&l1i, base, base);
-        used_l1_newer_data |= flush_l1_dirty_to_mem(&l1d, base, base);
+    if (active_policy == RANDOM && cache->assoc > 1U) {
+        return (size_t)(next_random() % cache->assoc);
+    }
 
-        if (!used_l1_newer_data && entry->modified) {
-            store_block_to_mem(base, entry->data);
+    for (way = 0; way < cache->assoc; ++way) {
+        uint64_t lru = *lru_at(cache, index, way);
+
+        if (lru < oldest_lru) {
+            oldest_lru = lru;
+            victim_way = way;
         }
-    } else if (entry->modified) {
-        push_block_to_l2(base, entry->data, 1);
     }
 
-    clear_entry(c, entry);
+    return victim_way;
 }
 
-static cache_line_t *load_l2_block(uint64_t addr, uint8_t track_stats) {
-    cache_line_t *entry;
-    uint8_t block[CACHE_LINE_SIZE];
+static void read_line_from_memory(uint64_t base_addr, uint8_t data[LINE_SIZE]) {
+    size_t byte;
 
-    if (track_stats) {
-        l2.stats.accesses++;
+    for (byte = 0; byte < LINE_SIZE; ++byte) {
+        data[byte] = read_memory(base_addr + byte);
     }
-
-    entry = lookup_line(&l2, addr);
-
-    if (entry != NULL) {
-        mark_used(&l2, entry);
-        return entry;
-    }
-
-    if (track_stats) {
-        l2.stats.misses++;
-    }
-
-    load_block_from_mem(block_start(addr), block);
-    return place_block(&l2, addr, block, 0);
 }
 
-static cache_store_t *other_l1(cache_store_t *c) {
-    if (c == &l1i) {
-        return &l1d;
-    }
+static void write_line_to_memory(uint64_t base_addr, const uint8_t data[LINE_SIZE]) {
+    size_t byte;
 
-    return &l1i;
+    for (byte = 0; byte < LINE_SIZE; ++byte) {
+        write_memory(base_addr + byte, data[byte]);
+    }
 }
 
-static void write_dirty_peer_to_l2(cache_store_t *requester, uint64_t addr) {
-    cache_store_t *peer = other_l1(requester);
-    cache_line_t *peer_entry = lookup_line(peer, addr);
+static void l2_write_line(uint64_t mem_addr, const uint8_t data[LINE_SIZE]);
 
-    if (peer_entry == NULL || !peer_entry->modified) {
+static void invalidate_l1_line(const cache_desc_t *cache, uint64_t mem_addr) {
+    cache_line_t *line = find_line_in_cache(cache, mem_addr);
+
+    if (line != NULL) {
+        line->valid = 0;
+        line->modified = 0;
+    }
+}
+
+static int flush_dirty_l1_line_to_memory(const cache_desc_t *l1_cache,
+                                         uint64_t mem_addr) {
+    cache_line_t *line = find_line_in_cache(l1_cache, mem_addr);
+
+    if (line != NULL && line->modified) {
+        ++l2_stats.accesses;
+        write_line_to_memory(line_base(mem_addr), line->data);
+        line->modified = 0;
+        invalidate_l1_line(l1_cache, mem_addr);
+        return 1;
+    }
+
+    invalidate_l1_line(l1_cache, mem_addr);
+    return 0;
+}
+
+static void evict_l2_line_if_needed(cache_line_t *line, size_t index) {
+    uint64_t victim_base;
+    int wrote_newer_l1_data = 0;
+
+    if (!line->valid) {
         return;
     }
 
-    push_block_to_l2(block_start(addr), peer_entry->data, 1);
-    peer_entry->modified = 0;
-    discard_l1_copy(requester, addr);
+    victim_base = compose_line_base(line->tag, index, &l2_cache);
+    wrote_newer_l1_data |= flush_dirty_l1_line_to_memory(&l1_instr_cache, victim_base);
+    wrote_newer_l1_data |= flush_dirty_l1_line_to_memory(&l1_data_cache, victim_base);
+
+    if (!wrote_newer_l1_data && line->modified) {
+        write_line_to_memory(victim_base, line->data);
+    }
 }
 
-static void invalidate_peer_copy(cache_store_t *owner, uint64_t addr) {
-    cache_store_t *peer = other_l1(owner);
-    cache_line_t *peer_entry = lookup_line(peer, addr);
+static cache_line_t *allocate_l2_line(uint64_t mem_addr, int fill_from_memory) {
+    size_t index = cache_index(mem_addr, &l2_cache);
+    size_t way = choose_victim_way(&l2_cache, index);
+    cache_line_t *line = line_at(&l2_cache, index, way);
 
-    if (peer_entry == NULL) {
+    evict_l2_line_if_needed(line, index);
+
+    line->valid = 1;
+    line->modified = 0;
+    line->tag = cache_tag(mem_addr, &l2_cache);
+
+    if (fill_from_memory) {
+        read_line_from_memory(line_base(mem_addr), line->data);
+    }
+
+    touch_way(&l2_cache, index, way);
+    return line;
+}
+
+static void l2_read_line(uint64_t mem_addr, uint8_t data[LINE_SIZE]) {
+    size_t index = cache_index(mem_addr, &l2_cache);
+    cache_line_t *line;
+    size_t way;
+
+    ++l2_stats.accesses;
+    line = find_line_in_cache(&l2_cache, mem_addr);
+
+    if (line == NULL) {
+        ++l2_stats.misses;
+        line = allocate_l2_line(mem_addr, 1);
+    } else {
+        way = way_for_line(&l2_cache, index, line);
+        touch_way(&l2_cache, index, way);
+    }
+
+    memcpy(data, line->data, LINE_SIZE);
+}
+
+static void l2_write_line(uint64_t mem_addr, const uint8_t data[LINE_SIZE]) {
+    size_t index = cache_index(mem_addr, &l2_cache);
+    cache_line_t *line;
+    size_t way;
+
+    ++l2_stats.accesses;
+    line = find_line_in_cache(&l2_cache, mem_addr);
+
+    if (line == NULL) {
+        ++l2_stats.misses;
+        line = allocate_l2_line(mem_addr, 0);
+    } else {
+        way = way_for_line(&l2_cache, index, line);
+        touch_way(&l2_cache, index, way);
+    }
+
+    memcpy(line->data, data, LINE_SIZE);
+    line->modified = 1;
+}
+
+static void write_back_dirty_other_l1(uint64_t mem_addr, mem_type_t requester) {
+    cache_desc_t *requesting_cache = requester == INSTR ? &l1_instr_cache : &l1_data_cache;
+    cache_desc_t *other_cache = requester == INSTR ? &l1_data_cache : &l1_instr_cache;
+    cache_line_t *other_line = find_line_in_cache(other_cache, mem_addr);
+
+    if (other_line != NULL && other_line->modified) {
+        l2_write_line(line_base(mem_addr), other_line->data);
+        other_line->modified = 0;
+        invalidate_l1_line(requesting_cache, mem_addr);
+    }
+}
+
+static void invalidate_other_l1_copy(uint64_t mem_addr, mem_type_t writer) {
+    cache_desc_t *other_cache = writer == INSTR ? &l1_data_cache : &l1_instr_cache;
+
+    invalidate_l1_line(other_cache, mem_addr);
+}
+
+static void write_back_dirty_l1_victim(const cache_desc_t *cache,
+                                       cache_line_t *line,
+                                       size_t index) {
+    uint64_t victim_base;
+
+    if (!line->valid || !line->modified) {
         return;
     }
 
-    discard_l1_copy(peer, addr);
+    victim_base = compose_line_base(line->tag, index, cache);
+    l2_write_line(victim_base, line->data);
+    line->modified = 0;
 }
 
+static cache_line_t *fill_l1_line(cache_desc_t *cache, uint64_t mem_addr) {
+    uint8_t data[LINE_SIZE];
+    size_t index = cache_index(mem_addr, cache);
+    size_t way = choose_victim_way(cache, index);
+    cache_line_t *line = line_at(cache, index, way);
+
+    l2_read_line(mem_addr, data);
+    write_back_dirty_l1_victim(cache, line, index);
+
+    line->valid = 1;
+    line->modified = 0;
+    line->tag = cache_tag(mem_addr, cache);
+    memcpy(line->data, data, LINE_SIZE);
+    touch_way(cache, index, way);
+
+    return line;
+}
+
+static cache_desc_t *cache_for_type(mem_type_t type) {
+    return type == INSTR ? &l1_instr_cache : &l1_data_cache;
+}
+
+// STUDENT TODO: initialize cache with replacement policy
 void init_cache(replacement_policy_e policy) {
     active_policy = policy;
-    lru_clock = 0;
-    srand(0);
+    random_state = 1U;
 
-    memset(l1i_entries, 0, sizeof(l1i_entries));
-    memset(l1d_entries, 0, sizeof(l1d_entries));
-    memset(l2_entries, 0, sizeof(l2_entries));
+    memset(l1_instr_lines, 0, sizeof(l1_instr_lines));
+    memset(l1_data_lines, 0, sizeof(l1_data_lines));
+    memset(l2_lines, 0, sizeof(l2_lines));
+    memset(l1_instr_lru, 0, sizeof(l1_instr_lru));
+    memset(l1_data_lru, 0, sizeof(l1_data_lru));
+    memset(l2_lru, 0, sizeof(l2_lru));
 
-    memset(l1i_recent, 0, sizeof(l1i_recent));
-    memset(l1d_recent, 0, sizeof(l1d_recent));
-    memset(l2_recent, 0, sizeof(l2_recent));
+    l1_instr_stats.accesses = 0;
+    l1_instr_stats.misses = 0;
+    l1_data_stats.accesses = 0;
+    l1_data_stats.misses = 0;
+    l2_stats.accesses = 0;
+    l2_stats.misses = 0;
 
-    setup_cache(&l1i, l1i_entries, l1i_recent,
-                HW11_L1_SIZE, HW11_L1_INSTR_ASSOC);
-
-    setup_cache(&l1d, l1d_entries, l1d_recent,
-                HW11_L1_SIZE, HW11_L1_DATA_ASSOC);
-
-    setup_cache(&l2, l2_entries, l2_recent,
-                HW11_L2_SIZE, HW11_L2_ASSOC);
+    l1_instr_clock = 0;
+    l1_data_clock = 0;
+    l2_clock = 0;
 }
 
+// STUDENT TODO: implement read cache, using the l1 and l2 structure
 uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
-    cache_store_t *l1 = (type == DATA) ? &l1d : &l1i;
-    cache_line_t *entry;
-    cache_line_t *l2_entry;
-    size_t offset = block_offset(mem_addr);
+    cache_desc_t *cache = cache_for_type(type);
+    cache_line_t *line;
+    size_t index;
+    size_t way;
 
-    write_dirty_peer_to_l2(l1, mem_addr);
+    write_back_dirty_other_l1(mem_addr, type);
 
-    l1->stats.accesses++;
-    entry = lookup_line(l1, mem_addr);
+    ++cache->stats->accesses;
+    line = find_line_in_cache(cache, mem_addr);
 
-    if (entry != NULL) {
-        mark_used(l1, entry);
-        return entry->data[offset];
+    if (line == NULL) {
+        ++cache->stats->misses;
+        line = fill_l1_line(cache, mem_addr);
+    } else {
+        index = cache_index(mem_addr, cache);
+        way = way_for_line(cache, index, line);
+        touch_way(cache, index, way);
     }
 
-    l1->stats.misses++;
-    l2_entry = load_l2_block(mem_addr, 1);
-    entry = place_block(l1, mem_addr, l2_entry->data, 0);
-
-    return entry->data[offset];
+    return line->data[mem_addr & (LINE_SIZE - 1U)];
 }
 
+// STUDENT TODO: implement write cache, using the l1 and l2 structure
 void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
-    cache_store_t *l1 = (type == DATA) ? &l1d : &l1i;
-    cache_line_t *entry;
-    cache_line_t *l2_entry;
-    size_t offset = block_offset(mem_addr);
+    cache_desc_t *cache = cache_for_type(type);
+    cache_line_t *line;
+    size_t index;
+    size_t way;
 
-    write_dirty_peer_to_l2(l1, mem_addr);
+    write_back_dirty_other_l1(mem_addr, type);
 
-    l1->stats.accesses++;
-    entry = lookup_line(l1, mem_addr);
+    ++cache->stats->accesses;
+    line = find_line_in_cache(cache, mem_addr);
 
-    if (entry == NULL) {
-        l1->stats.misses++;
-        l2_entry = load_l2_block(mem_addr, 1);
-        entry = place_block(l1, mem_addr, l2_entry->data, 0);
+    if (line == NULL) {
+        ++cache->stats->misses;
+        line = fill_l1_line(cache, mem_addr);
+    } else {
+        index = cache_index(mem_addr, cache);
+        way = way_for_line(cache, index, line);
+        touch_way(cache, index, way);
     }
 
-    entry->data[offset] = value;
-    entry->modified = 1;
-    mark_used(l1, entry);
-
-    invalidate_peer_copy(l1, mem_addr);
+    line->data[mem_addr & (LINE_SIZE - 1U)] = value;
+    line->modified = 1;
+    invalidate_other_l1_copy(mem_addr, type);
 }
 
+// STUDENT TODO: implement functions to get cache stats
 cache_stats_t get_l1_instr_stats() {
-    return l1i.stats;
+    return l1_instr_stats;
 }
 
 cache_stats_t get_l1_data_stats() {
-    return l1d.stats;
+    return l1_data_stats;
 }
 
 cache_stats_t get_l2_stats() {
-    return l2.stats;
+    return l2_stats;
 }
 
+// STUDENT TODO: implement a function returning a pointer to a specific cache line for an address
+//               or null if the line is not present in the cache
 cache_line_t* get_l1_instr_cache_line(uint64_t mem_addr) {
-    return lookup_line(&l1i, mem_addr);
+    return find_line_in_cache(&l1_instr_cache, mem_addr);
 }
 
 cache_line_t* get_l1_data_cache_line(uint64_t mem_addr) {
-    return lookup_line(&l1d, mem_addr);
+    return find_line_in_cache(&l1_data_cache, mem_addr);
 }
 
 cache_line_t* get_l2_cache_line(uint64_t mem_addr) {
-    return lookup_line(&l2, mem_addr);
+    return find_line_in_cache(&l2_cache, mem_addr);
 }
