@@ -282,12 +282,14 @@ static void l2_write_line(uint64_t mem_addr, const uint8_t data[LINE_SIZE]) {
 }
 
 static void write_back_dirty_other_l1(uint64_t mem_addr, mem_type_t requester) {
+    cache_desc_t *requesting_cache = requester == INSTR ? &l1_instr_cache : &l1_data_cache;
     cache_desc_t *other_cache = requester == INSTR ? &l1_data_cache : &l1_instr_cache;
     cache_line_t *other_line = find_line_in_cache(other_cache, mem_addr);
 
     if (other_line != NULL && other_line->modified) {
         l2_write_line(line_base(mem_addr), other_line->data);
         other_line->modified = 0;
+        invalidate_l1_line(requesting_cache, mem_addr);
     }
 }
 
@@ -364,12 +366,13 @@ uint8_t read_cache(uint64_t mem_addr, mem_type_t type) {
     size_t index;
     size_t way;
 
+    write_back_dirty_other_l1(mem_addr, type);
+
     ++cache->stats->accesses;
     line = find_line_in_cache(cache, mem_addr);
 
     if (line == NULL) {
         ++cache->stats->misses;
-        write_back_dirty_other_l1(mem_addr, type);
         line = fill_l1_line(cache, mem_addr);
     } else {
         index = cache_index(mem_addr, cache);
@@ -387,12 +390,13 @@ void write_cache(uint64_t mem_addr, uint8_t value, mem_type_t type) {
     size_t index;
     size_t way;
 
+    write_back_dirty_other_l1(mem_addr, type);
+
     ++cache->stats->accesses;
     line = find_line_in_cache(cache, mem_addr);
 
     if (line == NULL) {
         ++cache->stats->misses;
-        write_back_dirty_other_l1(mem_addr, type);
         line = fill_l1_line(cache, mem_addr);
     } else {
         index = cache_index(mem_addr, cache);
