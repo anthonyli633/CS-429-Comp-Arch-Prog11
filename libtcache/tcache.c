@@ -192,33 +192,35 @@ static void invalidate_l1_line(const cache_desc_t *cache, uint64_t mem_addr) {
     }
 }
 
-static void merge_dirty_l1_line_into_l2_victim(const cache_desc_t *l1_cache,
-                                               uint64_t mem_addr,
-                                               cache_line_t *l2_victim) {
+static int flush_dirty_l1_line_to_memory(const cache_desc_t *l1_cache,
+                                         uint64_t mem_addr) {
     cache_line_t *line = find_line_in_cache(l1_cache, mem_addr);
 
     if (line != NULL && line->modified) {
         ++l2_stats.accesses;
-        memcpy(l2_victim->data, line->data, LINE_SIZE);
-        l2_victim->modified = 1;
+        write_line_to_memory(line_base(mem_addr), line->data);
         line->modified = 0;
+        invalidate_l1_line(l1_cache, mem_addr);
+        return 1;
     }
+
+    invalidate_l1_line(l1_cache, mem_addr);
+    return 0;
 }
 
 static void evict_l2_line_if_needed(cache_line_t *line, size_t index) {
     uint64_t victim_base;
+    int wrote_newer_l1_data = 0;
 
     if (!line->valid) {
         return;
     }
 
     victim_base = compose_line_base(line->tag, index, &l2_cache);
-    merge_dirty_l1_line_into_l2_victim(&l1_instr_cache, victim_base, line);
-    merge_dirty_l1_line_into_l2_victim(&l1_data_cache, victim_base, line);
-    invalidate_l1_line(&l1_instr_cache, victim_base);
-    invalidate_l1_line(&l1_data_cache, victim_base);
+    wrote_newer_l1_data |= flush_dirty_l1_line_to_memory(&l1_instr_cache, victim_base);
+    wrote_newer_l1_data |= flush_dirty_l1_line_to_memory(&l1_data_cache, victim_base);
 
-    if (line->modified) {
+    if (!wrote_newer_l1_data && line->modified) {
         write_line_to_memory(victim_base, line->data);
     }
 }
