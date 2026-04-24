@@ -317,11 +317,16 @@ static void write_back_dirty_l1_victim(const cache_desc_t *cache,
 
 static cache_line_t *fill_l1_line(cache_desc_t *cache, uint64_t mem_addr) {
     uint8_t data[LINE_SIZE];
-    size_t index = cache_index(mem_addr, cache);
-    size_t way = choose_victim_way(cache, index);
-    cache_line_t *line = line_at(cache, index, way);
+    size_t index;
+    size_t way;
+    cache_line_t *line;
 
     l2_read_line(mem_addr, data);
+
+    index = cache_index(mem_addr, cache);
+    way = choose_victim_way(cache, index);
+    line = line_at(cache, index, way);
+
     write_back_dirty_l1_victim(cache, line, index);
 
     line->valid = 1;
